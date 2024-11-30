@@ -1,0 +1,128 @@
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import os
+import numpy as np
+
+# Загрузка данных
+data_path = 'C:/Users/User/Desktop/rinhack/dataset'
+data = pd.read_csv(data_path)
+
+# Удаление пропусков
+data = data.dropna()
+
+# Преобразование качественных данных в количественные
+le = LabelEncoder()
+categorical_columns = ['device_type', 'tran_code', 'card_type', 'oper_type', 'card_status']
+for col in categorical_columns:
+    if col in data.columns:
+        data[col] = le.fit_transform(data[col].astype(str))
+
+# Создание временных признаков
+if 'datetime' in data.columns:
+    data['datetime'] = pd.to_datetime(data['datetime'], errors='coerce')
+    if data['datetime'].isnull().any():
+        raise ValueError("Некорректные значения в столбце 'datetime' после преобразования.")
+    data['hour'] = data['datetime'].dt.hour
+    data['day_of_week'] = data['datetime'].dt.dayofweek
+else:
+    raise ValueError("В датасете отсутствует столбец 'datetime'.")
+
+# Проверка числовых столбцов перед нормализацией
+numeric_columns = ['sum', 'balance', 'pin_inc_count']
+for col in numeric_columns:
+    if col not in data.columns:
+        raise ValueError(f"Отсутствует числовой столбец: {col}")
+
+# Нормализация числовых данных
+scaler = MinMaxScaler()
+data[numeric_columns] = scaler.fit_transform(data[numeric_columns])
+
+# Определение признаков для обучения
+features = ['sum', 'balance', 'pin_inc_count', 'device_type', 'hour', 'day_of_week', 'tran_code', 'oper_type', 'card_status']
+missing_features = [col for col in features if col not in data.columns]
+if missing_features:
+    raise ValueError(f"Отсутствуют признаки для обучения: {missing_features}")
+
+# Инициализация моделей
+models = {
+    "Isolation Forest": IsolationForest(n_estimators=200, contamination=0.02, random_state=42),
+    "One-Class SVM": OneClassSVM(nu=0.02, kernel="rbf", gamma='scale'),
+    "Local Outlier Factor": LocalOutlierFactor(n_neighbors=20, contamination=0.02)
+}
+
+# Обучение моделей
+predictions = []
+
+for model_name, model in models.items():
+    model.fit(data[features])
+    if model_name == "Local Outlier Factor":
+        # LOF использует fit_predict с возвращаемыми метками (-1 для аномалий, 1 для нормальных)
+        predictions.append(model.fit_predict(data[features]) == -1)
+    else:
+        predictions.append(model.predict(data[features]) == -1)
+
+# Суммируем предсказания всех моделей (голосование)
+final_predictions = np.sum(predictions, axis=0) >= len(models) / 2  # Больше половины голосов -> аномалия
+
+# Преобразование метки аномалии в булевое значение (True для аномалий, False для нормальных операций)
+data['anomaly_flag'] = final_predictions
+
+# Сохранение предсказаний в файл preds.csv
+output_preds_path = r'C:/Users/User/Desktop/rinhack/preds.csv'
+directory = os.path.dirname(output_preds_path)
+if not os.path.exists(directory):
+    raise ValueError(f"Ошибка: Путь '{directory}' не существует.")
+else:
+    data['anomaly_flag'].to_csv(output_preds_path, index=False, header=False)
+    print(f"Предсказания успешно сохранены в файл: {output_preds_path}")
+
+# Вывод статистики по аномалиям
+print("Количество операций:")
+print(data['anomaly_flag'].value_counts())
+
+# Визуализация аномалий по суммам и балансу
+sns.scatterplot(
+    data=data, 
+    x='sum', 
+    y='balance', 
+    hue='anomaly_flag', 
+    palette={True: 'red', False: 'blue'}
+)
+plt.title("Аномалии по сумме и балансу")
+plt.xlabel("Сумма")
+plt.ylabel("Баланс")
+plt.show()
+
+# Временная активность аномалий
+sns.countplot(
+    data=data[data['anomaly_flag'] == True], 
+    x='hour', 
+    color='red'
+)
+plt.title("Аномалии по времени суток")
+plt.xlabel("Час дня")
+plt.ylabel("Количество аномалий")
+plt.show()
+
+# Сохранение модели для дальнейшего использования
+model_path = r'C:/Users/User/Desktop/rinhack/anomaly_detection_model.pkl'
+joblib.dump(models, model_path)
+print(f"Модели сохранены в файл: {model_path}")
+
+# Загрузка моделей для использования (опционально)
+loaded_models = joblib.load(model_path)
+
+# Прогнозы для всего массива данных с использованием загруженных моделей
+final_predictions_loaded = np.sum([model.fit_predict(data[features]) == -1 for model in loaded_models.values()], axis=0) >= len(loaded_models) / 2
+data['anomaly_flag'] = final_predictions_loaded
+
+# Сохранение всех предсказаний в файл preds.csv
+output_preds_path = r'C:/Users/User/Desktop/rinhack/preds.csv'
+data['anomaly_flag'].to_csv(output_preds_path, index=False, header=False)
+print(f"Предсказания для всех данных успешно сохранены в файл: {output_preds_path}")
