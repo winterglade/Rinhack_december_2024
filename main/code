@@ -1,13 +1,13 @@
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
-from sklearn.neighbors import LocalOutlierFactor
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import f1_score, classification_report
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
 import seaborn as sns
-import joblib
 import os
-import numpy as np
 
 # Загрузка данных
 data_path = 'C:/Users/User/Desktop/rinhack/dataset'
@@ -16,113 +16,123 @@ data = pd.read_csv(data_path)
 # Удаление пропусков
 data = data.dropna()
 
-# Преобразование качественных данных в количественные
+# Преобразование категориальных данных
 le = LabelEncoder()
-categorical_columns = ['device_type', 'tran_code', 'card_type', 'oper_type', 'card_status']
-for col in categorical_columns:
-    if col in data.columns:
-        data[col] = le.fit_transform(data[col].astype(str))
+for col in ['device_type', 'tran_code', 'card_type', 'oper_type', 'card_status']:
+    data[col] = le.fit_transform(data[col].astype(str))
 
 # Создание временных признаков
-if 'datetime' in data.columns:
-    data['datetime'] = pd.to_datetime(data['datetime'], errors='coerce')
-    if data['datetime'].isnull().any():
-        raise ValueError("Некорректные значения в столбце 'datetime' после преобразования.")
-    data['hour'] = data['datetime'].dt.hour
-    data['day_of_week'] = data['datetime'].dt.dayofweek
-else:
-    raise ValueError("В датасете отсутствует столбец 'datetime'.")
-
-# Проверка числовых столбцов перед нормализацией
-numeric_columns = ['sum', 'balance', 'pin_inc_count']
-for col in numeric_columns:
-    if col not in data.columns:
-        raise ValueError(f"Отсутствует числовой столбец: {col}")
+data['datetime'] = pd.to_datetime(data['datetime'], errors='coerce')
+data['hour'] = data['datetime'].dt.hour
+data['day_of_week'] = data['datetime'].dt.dayofweek
 
 # Нормализация числовых данных
 scaler = MinMaxScaler()
-data[numeric_columns] = scaler.fit_transform(data[numeric_columns])
+data[['sum', 'balance', 'pin_inc_count']] = scaler.fit_transform(data[['sum', 'balance', 'pin_inc_count']])
 
-# Определение признаков для обучения
-features = ['sum', 'balance', 'pin_inc_count', 'device_type', 'hour', 'day_of_week', 'tran_code', 'oper_type', 'card_status']
-missing_features = [col for col in features if col not in data.columns]
-if missing_features:
-    raise ValueError(f"Отсутствуют признаки для обучения: {missing_features}")
+# Признаки для модели
+features = ['sum', 'balance', 'pin_inc_count', 'device_type', 'hour',
+            'day_of_week', 'tran_code', 'oper_type', 'card_status']
 
-# Инициализация моделей
-models = {
-    "Isolation Forest": IsolationForest(n_estimators=200, contamination=0.02, random_state=42),
-    "One-Class SVM": OneClassSVM(nu=0.02, kernel="rbf", gamma='scale'),
-    "Local Outlier Factor": LocalOutlierFactor(n_neighbors=20, contamination=0.02)
+X = data[features]
+
+# Разделение данных на обучающую и тестовую выборки
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=42)
+
+# Определение модели KNN для поиска аномалий
+knn = NearestNeighbors()
+
+param_grid = {
+    'n_neighbors': [5, 10, 15, 20, 25, 30, 40, 50],
+    'metric': ['euclidean', 'manhattan', 'chebyshev', 'cosine'],
+    'algorithm': ['auto', 'ball_tree', 'kd_tree', 'brute'],
+    'leaf_size': [10, 20, 30, 40, 50]
 }
 
-# Обучение моделей
-predictions = []
-
-for model_name, model in models.items():
-    model.fit(data[features])
-    if model_name == "Local Outlier Factor":
-        # LOF использует fit_predict с возвращаемыми метками (-1 для аномалий, 1 для нормальных)
-        predictions.append(model.fit_predict(data[features]) == -1)
+# Применим фильтрацию: метрика 'cosine' используется только с 'brute' алгоритмом
+filtered_param_grid = []
+for algorithm in ['auto', 'ball_tree', 'kd_tree', 'brute']:
+    if algorithm == 'brute':
+        metrics = ['euclidean', 'manhattan', 'chebyshev', 'cosine']  # Для brute добавляем 'cosine'
     else:
-        predictions.append(model.predict(data[features]) == -1)
+        metrics = ['euclidean', 'manhattan', 'chebyshev']  # Для остальных алгоритмов убираем 'cosine'
+    
+    for metric in metrics:
+        filtered_param_grid.append({
+            'n_neighbors': [5, 10, 15, 20, 25, 30, 40, 50],
+            'metric': [metric],
+            'algorithm': [algorithm],
+            'leaf_size': [10, 20, 30, 40, 50]
+        })
 
-# Суммируем предсказания всех моделей (голосование)
-final_predictions = np.sum(predictions, axis=0) >= len(models) / 2  # Больше половины голосов -> аномалия
+# Теперь используем `filtered_param_grid` в GridSearchCV
+grid_search = GridSearchCV(estimator=knn, param_grid=filtered_param_grid, cv=3, scoring='neg_mean_squared_error', verbose=1, n_jobs=-1)
 
-# Преобразование метки аномалии в булевое значение (True для аномалий, False для нормальных операций)
-data['anomaly_flag'] = final_predictions
+# Обучение модели с подбором параметров
+grid_search.fit(X_train)
 
-# Сохранение предсказаний в файл preds.csv
-output_preds_path = r'C:/Users/User/Desktop/rinhack/preds.csv'
-directory = os.path.dirname(output_preds_path)
-if not os.path.exists(directory):
-    raise ValueError(f"Ошибка: Путь '{directory}' не существует.")
-else:
-    data['anomaly_flag'].to_csv(output_preds_path, index=False, header=False)
-    print(f"Предсказания успешно сохранены в файл: {output_preds_path}")
+# Лучшие параметры
+print("Лучшие параметры KNN:", grid_search.best_params_)
 
-# Вывод статистики по аномалиям
-print("Количество операций:")
-print(data['anomaly_flag'].value_counts())
+# Получаем лучшую модель
+best_knn = grid_search.best_estimator_
 
-# Визуализация аномалий по суммам и балансу
-sns.scatterplot(
-    data=data, 
-    x='sum', 
-    y='balance', 
-    hue='anomaly_flag', 
-    palette={True: 'red', False: 'blue'}
-)
+# Расстояния до ближайших соседей для обучения
+distances, _ = best_knn.kneighbors(X_train)
+
+# Задание порога для аномалий
+threshold = 0.8 * distances.max()
+
+# Создание меток для обучения (True - аномалия, False - нормальная точка)
+y_train = (distances[:, -1] > threshold)
+y_test = (best_knn.kneighbors(X_test)[0][:, -1] > threshold)
+
+# Определение моделей
+rf = RandomForestClassifier(random_state=42)
+lr = LogisticRegression(max_iter=1000, random_state=42)
+
+# Создание VotingClassifier (мягкое голосование)
+voting_clf = VotingClassifier(estimators=[
+    ('rf', rf),
+    ('lr', lr)
+], voting='soft')
+
+# Обучение на тренировочных данных с метками
+voting_clf.fit(X_train, y_train)
+
+# Получение предсказаний
+y_train_pred = voting_clf.predict(X_train)
+y_test_pred = voting_clf.predict(X_test)
+
+# Оценка метрик
+print(f"F1-Score (Train): {f1_score(y_train, y_train_pred)}")
+print(f"F1-Score (Test): {f1_score(y_test, y_test_pred)}")
+print(f"Classification Report (Test):\n{classification_report(y_test, y_test_pred)}")
+
+# Визуализация 1: Аномалии по сумме и балансу
+data['anomaly_flag'] = voting_clf.predict(X[features])  # Метки аномалий для всех данных
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=data, x='sum', y='balance', hue='anomaly_flag', palette={True: 'red', False: 'blue'})
 plt.title("Аномалии по сумме и балансу")
 plt.xlabel("Сумма")
 plt.ylabel("Баланс")
+plt.legend(title='Аномалия', loc='upper right')
 plt.show()
 
-# Временная активность аномалий
-sns.countplot(
-    data=data[data['anomaly_flag'] == True], 
-    x='hour', 
-    color='red'
-)
-plt.title("Аномалии по времени суток")
-plt.xlabel("Час дня")
-plt.ylabel("Количество аномалий")
+# Визуализация 2: Корреляционная матрица
+plt.figure(figsize=(12, 8))
+sns.heatmap(data[features + ['anomaly_flag']].corr(), annot=True, cmap="coolwarm", fmt=".2f")
+plt.title("Корреляция признаков с аномалиями")
 plt.show()
 
-# Сохранение модели для дальнейшего использования
-model_path = r'C:/Users/User/Desktop/rinhack/anomaly_detection_model.pkl'
-joblib.dump(models, model_path)
-print(f"Модели сохранены в файл: {model_path}")
+# Сохранение результатов в CSV файл
+output_preds_path = r'C:/Users/User/Desktop/rinhack/preds.csv'  # Укажите путь для сохранения
+directory = os.path.dirname(output_preds_path)
 
-# Загрузка моделей для использования (опционально)
-loaded_models = joblib.load(model_path)
-
-# Прогнозы для всего массива данных с использованием загруженных моделей
-final_predictions_loaded = np.sum([model.fit_predict(data[features]) == -1 for model in loaded_models.values()], axis=0) >= len(loaded_models) / 2
-data['anomaly_flag'] = final_predictions_loaded
-
-# Сохранение всех предсказаний в файл preds.csv
-output_preds_path = r'C:/Users/User/Desktop/rinhack/preds.csv'
-data['anomaly_flag'].to_csv(output_preds_path, index=False, header=False)
-print(f"Предсказания для всех данных успешно сохранены в файл: {output_preds_path}")
+# Проверка, существует ли директория
+if not os.path.exists(directory):
+    raise ValueError(f"Ошибка: Путь '{directory}' не существует.")
+else:
+    # Сохранение данных
+    data[['anomaly_flag']].to_csv(output_preds_path, index=False)
+    print(f"Результаты успешно сохранены в файл: {output_preds_path}")
